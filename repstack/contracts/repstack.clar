@@ -1,12 +1,14 @@
-;; RepStack - DAO Reputation System
-;; A reputation tracking system for DAOs on Stacks blockchain
+;; RepStack - Enhanced DAO Reputation System
+;; A comprehensive reputation tracking system for DAOs on Stacks blockchain
 
 (define-constant contract-owner tx-sender)
 (define-constant err-owner-only (err u100))
 (define-constant err-not-found (err u101))
 (define-constant err-unauthorized (err u102))
+(define-constant err-invalid-score (err u103))
+(define-constant err-invalid-parameter (err u104))
 
-;; Data Maps
+;; Enhanced Data Maps
 (define-map user-scores 
     principal 
     {
@@ -14,111 +16,238 @@
         proposal-count: uint,
         vote-count: uint,
         last-action: uint,
-        contribution-count: uint
+        contribution-count: uint,
+        successful-proposals: uint,
+        vote-participation-rate: uint,
+        community-kudos: uint
     }
 )
 
 (define-map contribution-weights
     {action: (string-ascii 24)}
-    {weight: uint}
+    {
+        base-weight: uint,
+        multiplier: uint,
+        minimum-threshold: uint
+    }
 )
 
-;; Initialize contribution weights
-(map-set contribution-weights {action: "proposal"} {weight: u10})
-(map-set contribution-weights {action: "vote"} {weight: u5})
-(map-set contribution-weights {action: "contribution"} {weight: u15})
+(define-map proposal-records
+    uint
+    {
+        proposer: principal,
+        status: (string-ascii 12),
+        vote-count: uint,
+        created-at: uint
+    }
+)
 
-;; Public functions
+;; Initialize contribution weights with enhanced parameters
+(map-set contribution-weights 
+    {action: "proposal"} 
+    {
+        base-weight: u10,
+        multiplier: u2,
+        minimum-threshold: u5
+    }
+)
+(map-set contribution-weights 
+    {action: "vote"} 
+    {
+        base-weight: u5,
+        multiplier: u1,
+        minimum-threshold: u10
+    }
+)
+(map-set contribution-weights 
+    {action: "contribution"} 
+    {
+        base-weight: u15,
+        multiplier: u3,
+        minimum-threshold: u3
+    }
+)
+
+;; Enhanced Public Functions
 
 (define-public (initialize-user)
     (begin
-        (asserts! (is-none (get-user-score tx-sender)) (err u103))
+        (asserts! (is-none (get-user-score tx-sender)) (err u105))
         (ok (map-set user-scores tx-sender {
             reputation-score: u0,
             proposal-count: u0,
             vote-count: u0,
             last-action: block-height,
-            contribution-count: u0
+            contribution-count: u0,
+            successful-proposals: u0,
+            vote-participation-rate: u0,
+            community-kudos: u0
         }))
     )
 )
 
-(define-public (record-proposal)
+(define-public (record-proposal (proposal-id uint))
     (let (
-        (user-data (unwrap! (get-user-score tx-sender) (err u104)))
-        (proposal-weight (get weight (unwrap! (map-get? contribution-weights {action: "proposal"}) (err u105))))
+        (user-data (unwrap! (get-user-score tx-sender) (err u106)))
+        (weight-data (unwrap! (map-get? contribution-weights {action: "proposal"}) (err u107)))
+        (new-score (calculate-weighted-score 
+            (get base-weight weight-data) 
+            (get multiplier weight-data) 
+            (get proposal-count user-data)
+        ))
     )
-    (ok (map-set user-scores tx-sender (merge user-data {
-        reputation-score: (+ (get reputation-score user-data) proposal-weight),
-        proposal-count: (+ (get proposal-count user-data) u1),
-        last-action: block-height
-    })))
-    )
+    (begin
+        (map-set proposal-records proposal-id {
+            proposer: tx-sender,
+            status: "active",
+            vote-count: u0,
+            created-at: block-height
+        })
+        (ok (map-set user-scores tx-sender (merge user-data {
+            reputation-score: (+ (get reputation-score user-data) new-score),
+            proposal-count: (+ (get proposal-count user-data) u1),
+            last-action: block-height
+        })))
+    ))
 )
 
-(define-public (record-vote)
+(define-public (record-vote (proposal-id uint))
     (let (
-        (user-data (unwrap! (get-user-score tx-sender) (err u104)))
-        (vote-weight (get weight (unwrap! (map-get? contribution-weights {action: "vote"}) (err u105))))
+        (user-data (unwrap! (get-user-score tx-sender) (err u106)))
+        (weight-data (unwrap! (map-get? contribution-weights {action: "vote"}) (err u107)))
+        (proposal-data (unwrap! (map-get? proposal-records proposal-id) (err u108)))
+        (new-score (calculate-weighted-score 
+            (get base-weight weight-data) 
+            (get multiplier weight-data) 
+            (get vote-count user-data)
+        ))
     )
-    (ok (map-set user-scores tx-sender (merge user-data {
-        reputation-score: (+ (get reputation-score user-data) vote-weight),
-        vote-count: (+ (get vote-count user-data) u1),
-        last-action: block-height
-    })))
-    )
+    (begin
+        (map-set proposal-records proposal-id 
+            (merge proposal-data {vote-count: (+ (get vote-count proposal-data) u1)}))
+        (ok (map-set user-scores tx-sender (merge user-data {
+            reputation-score: (+ (get reputation-score user-data) new-score),
+            vote-count: (+ (get vote-count user-data) u1),
+            vote-participation-rate: (calculate-participation-rate 
+                (+ (get vote-count user-data) u1) 
+                (get proposal-count user-data)
+            ),
+            last-action: block-height
+        })))
+    ))
 )
 
-(define-public (record-contribution)
+(define-public (update-proposal-status (proposal-id uint) (new-status (string-ascii 12)))
     (let (
-        (user-data (unwrap! (get-user-score tx-sender) (err u104)))
-        (contribution-weight (get weight (unwrap! (map-get? contribution-weights {action: "contribution"}) (err u105))))
+        (proposal-data (unwrap! (map-get? proposal-records proposal-id) (err u108)))
+        (proposer-data (unwrap! (get-user-score (get proposer proposal-data)) (err u109)))
     )
-    (ok (map-set user-scores tx-sender (merge user-data {
-        reputation-score: (+ (get reputation-score user-data) contribution-weight),
-        contribution-count: (+ (get contribution-count user-data) u1),
-        last-action: block-height
-    })))
-    )
-)
-
-;; Admin functions
-
-(define-public (update-weight (action (string-ascii 24)) (new-weight uint))
     (begin
         (asserts! (is-eq tx-sender contract-owner) err-owner-only)
-        (ok (map-set contribution-weights {action: action} {weight: new-weight}))
+        (asserts! (or (is-eq new-status "successful") (is-eq new-status "failed")) err-invalid-parameter)
+        (if (is-eq new-status "successful")
+            (map-set user-scores (get proposer proposal-data) 
+                (merge proposer-data {
+                    successful-proposals: (+ (get successful-proposals proposer-data) u1),
+                    reputation-score: (+ (get reputation-score proposer-data) u50)
+                })
+            )
+            true
+        )
+        (ok (map-set proposal-records proposal-id 
+            (merge proposal-data {status: new-status})))
+    ))
+)
+
+(define-public (award-community-kudos (user principal))
+    (let (
+        (recipient-data (unwrap! (get-user-score user) (err u110)))
+    )
+    (begin
+        (asserts! (not (is-eq tx-sender user)) err-unauthorized)
+        (ok (map-set user-scores user (merge recipient-data {
+            community-kudos: (+ (get community-kudos recipient-data) u1),
+            reputation-score: (+ (get reputation-score recipient-data) u5)
+        })))
+    ))
+)
+
+;; Enhanced Private Functions
+
+(define-private (calculate-weighted-score (base uint) (multiplier uint) (count uint))
+    (let (
+        (activity-bonus (if (> count u10) u2 u1))
+    )
+    (* base (* multiplier activity-bonus))
     )
 )
 
-;; Read-only functions
+(define-private (calculate-participation-rate (votes uint) (total-proposals uint))
+    (if (> total-proposals u0)
+        (* (/ votes total-proposals) u100)
+        u0
+    )
+)
+
+(define-private (decay-score (original-score uint) (blocks-passed uint))
+    (let (
+        (decay-factor (/ blocks-passed u1000))
+        (minimum-score (/ original-score u10))
+        (decayed-score (if (> decay-factor u0)
+            (/ original-score decay-factor)
+            original-score))
+    )
+    (if (< decayed-score minimum-score)
+        minimum-score
+        decayed-score)
+    )
+)
+
+;; Enhanced Read-only Functions
 
 (define-read-only (get-user-score (user principal))
     (map-get? user-scores user)
+)
+
+(define-read-only (get-proposal-data (proposal-id uint))
+    (map-get? proposal-records proposal-id)
 )
 
 (define-read-only (get-action-weight (action (string-ascii 24)))
     (map-get? contribution-weights {action: action})
 )
 
-;; Helper functions
-
-(define-private (decay-score (original-score uint) (blocks-passed uint))
-    (let (
-        (decay-factor (/ blocks-passed u1000))
-    )
-    (if (> decay-factor u0)
-        (/ original-score decay-factor)
-        original-score
-    ))
-)
-
-;; Score calculation with decay
 (define-read-only (get-current-score (user principal))
     (let (
         (user-data (unwrap! (get-user-score user) err-not-found))
         (blocks-since-last-action (- block-height (get last-action user-data)))
+        (base-score (get reputation-score user-data))
+        (participation-bonus (if (> (get vote-participation-rate user-data) u75) u50 u0))
+        (success-bonus (* (get successful-proposals user-data) u25))
     )
-    (ok (decay-score (get reputation-score user-data) blocks-since-last-action))
+    (ok (+ 
+        (+ (decay-score base-score blocks-since-last-action) participation-bonus)
+        success-bonus
+    )))
+)
+
+;; Administrative Functions
+
+(define-public (update-weight-parameters 
+    (action (string-ascii 24)) 
+    (base-weight uint) 
+    (multiplier uint) 
+    (minimum-threshold uint)
+)
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (ok (map-set contribution-weights 
+            {action: action} 
+            {
+                base-weight: base-weight,
+                multiplier: multiplier,
+                minimum-threshold: minimum-threshold
+            }
+        ))
     )
 )
