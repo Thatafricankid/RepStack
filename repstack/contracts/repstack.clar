@@ -7,6 +7,10 @@
 (define-constant err-unauthorized (err u102))
 (define-constant err-invalid-score (err u103))
 (define-constant err-invalid-parameter (err u104))
+(define-constant err-invalid-proposal-id (err u111))
+(define-constant err-invalid-action (err u112))
+(define-constant max-proposal-id u1000000)
+(define-constant max-weight u1000)
 
 ;; Enhanced Data Maps
 (define-map user-scores 
@@ -68,6 +72,26 @@
     }
 )
 
+;; Input Validation Functions
+(define-private (is-valid-proposal-id (proposal-id uint))
+    (and 
+        (> proposal-id u0)
+        (<= proposal-id max-proposal-id)
+    )
+)
+
+(define-private (is-valid-weight (weight uint))
+    (<= weight max-weight)
+)
+
+(define-private (is-valid-action (action (string-ascii 24)))
+    (or 
+        (is-eq action "proposal")
+        (is-eq action "vote")
+        (is-eq action "contribution")
+    )
+)
+
 ;; Enhanced Public Functions
 
 (define-public (initialize-user)
@@ -87,76 +111,88 @@
 )
 
 (define-public (record-proposal (proposal-id uint))
-    (let (
-        (user-data (unwrap! (get-user-score tx-sender) (err u106)))
-        (weight-data (unwrap! (map-get? contribution-weights {action: "proposal"}) (err u107)))
-        (new-score (calculate-weighted-score 
-            (get base-weight weight-data) 
-            (get multiplier weight-data) 
-            (get proposal-count user-data)
+    (begin
+        (asserts! (is-valid-proposal-id proposal-id) err-invalid-proposal-id)
+        (let (
+            (user-data (unwrap! (get-user-score tx-sender) (err u106)))
+            (weight-data (unwrap! (map-get? contribution-weights {action: "proposal"}) (err u107)))
+            (new-score (calculate-weighted-score 
+                (get base-weight weight-data) 
+                (get multiplier weight-data) 
+                (get proposal-count user-data)
+            ))
+        )
+        (begin
+            (asserts! (is-none (map-get? proposal-records proposal-id)) err-invalid-parameter)
+            (map-set proposal-records proposal-id {
+                proposer: tx-sender,
+                status: "active",
+                vote-count: u0,
+                created-at: block-height
+            })
+            (ok (map-set user-scores tx-sender (merge user-data {
+                reputation-score: (+ (get reputation-score user-data) new-score),
+                proposal-count: (+ (get proposal-count user-data) u1),
+                last-action: block-height
+            })))
         ))
     )
-    (begin
-        (map-set proposal-records proposal-id {
-            proposer: tx-sender,
-            status: "active",
-            vote-count: u0,
-            created-at: block-height
-        })
-        (ok (map-set user-scores tx-sender (merge user-data {
-            reputation-score: (+ (get reputation-score user-data) new-score),
-            proposal-count: (+ (get proposal-count user-data) u1),
-            last-action: block-height
-        })))
-    ))
 )
 
 (define-public (record-vote (proposal-id uint))
-    (let (
-        (user-data (unwrap! (get-user-score tx-sender) (err u106)))
-        (weight-data (unwrap! (map-get? contribution-weights {action: "vote"}) (err u107)))
-        (proposal-data (unwrap! (map-get? proposal-records proposal-id) (err u108)))
-        (new-score (calculate-weighted-score 
-            (get base-weight weight-data) 
-            (get multiplier weight-data) 
-            (get vote-count user-data)
+    (begin
+        (asserts! (is-valid-proposal-id proposal-id) err-invalid-proposal-id)
+        (let (
+            (user-data (unwrap! (get-user-score tx-sender) (err u106)))
+            (weight-data (unwrap! (map-get? contribution-weights {action: "vote"}) (err u107)))
+            (proposal-data (unwrap! (map-get? proposal-records proposal-id) (err u108)))
+            (new-score (calculate-weighted-score 
+                (get base-weight weight-data) 
+                (get multiplier weight-data) 
+                (get vote-count user-data)
+            ))
+            (new-vote-count (+ (get vote-count proposal-data) u1))
+        )
+        (begin
+            (asserts! (is-eq (get status proposal-data) "active") err-invalid-parameter)
+            (map-set proposal-records proposal-id 
+                (merge proposal-data {vote-count: new-vote-count}))
+            (ok (map-set user-scores tx-sender (merge user-data {
+                reputation-score: (+ (get reputation-score user-data) new-score),
+                vote-count: (+ (get vote-count user-data) u1),
+                vote-participation-rate: (calculate-participation-rate 
+                    (+ (get vote-count user-data) u1) 
+                    (get proposal-count user-data)
+                ),
+                last-action: block-height
+            })))
         ))
     )
-    (begin
-        (map-set proposal-records proposal-id 
-            (merge proposal-data {vote-count: (+ (get vote-count proposal-data) u1)}))
-        (ok (map-set user-scores tx-sender (merge user-data {
-            reputation-score: (+ (get reputation-score user-data) new-score),
-            vote-count: (+ (get vote-count user-data) u1),
-            vote-participation-rate: (calculate-participation-rate 
-                (+ (get vote-count user-data) u1) 
-                (get proposal-count user-data)
-            ),
-            last-action: block-height
-        })))
-    ))
 )
 
 (define-public (update-proposal-status (proposal-id uint) (new-status (string-ascii 12)))
-    (let (
-        (proposal-data (unwrap! (map-get? proposal-records proposal-id) (err u108)))
-        (proposer-data (unwrap! (get-user-score (get proposer proposal-data)) (err u109)))
-    )
     (begin
-        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
-        (asserts! (or (is-eq new-status "successful") (is-eq new-status "failed")) err-invalid-parameter)
-        (if (is-eq new-status "successful")
-            (map-set user-scores (get proposer proposal-data) 
-                (merge proposer-data {
-                    successful-proposals: (+ (get successful-proposals proposer-data) u1),
-                    reputation-score: (+ (get reputation-score proposer-data) u50)
-                })
-            )
-            true
+        (asserts! (is-valid-proposal-id proposal-id) err-invalid-proposal-id)
+        (let (
+            (proposal-data (unwrap! (map-get? proposal-records proposal-id) (err u108)))
+            (proposer-data (unwrap! (get-user-score (get proposer proposal-data)) (err u109)))
         )
-        (ok (map-set proposal-records proposal-id 
-            (merge proposal-data {status: new-status})))
-    ))
+        (begin
+            (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+            (asserts! (or (is-eq new-status "successful") (is-eq new-status "failed")) err-invalid-parameter)
+            (if (is-eq new-status "successful")
+                (map-set user-scores (get proposer proposal-data) 
+                    (merge proposer-data {
+                        successful-proposals: (+ (get successful-proposals proposer-data) u1),
+                        reputation-score: (+ (get reputation-score proposer-data) u50)
+                    })
+                )
+                true
+            )
+            (ok (map-set proposal-records proposal-id 
+                (merge proposal-data {status: new-status})))
+        ))
+    )
 )
 
 (define-public (award-community-kudos (user principal))
@@ -241,6 +277,10 @@
 )
     (begin
         (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts! (is-valid-action action) err-invalid-action)
+        (asserts! (is-valid-weight base-weight) err-invalid-parameter)
+        (asserts! (is-valid-weight multiplier) err-invalid-parameter)
+        (asserts! (is-valid-weight minimum-threshold) err-invalid-parameter)
         (ok (map-set contribution-weights 
             {action: action} 
             {
